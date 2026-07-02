@@ -1,0 +1,2369 @@
+// ==================== SMART WAGER FARMING BY ORIONLOGIC ====================
+(function () {
+    // ==================== LOAD CONFIG ====================
+    let accessToken = "";
+    let cur = "usdt";
+    
+    const FALLBACK_CURRENCIES = ["BTC", "ETH", "LTC", "DOGE", "TRX", "USDT", "BNB", "SOL", "ADA", "XRP", "BCH", "EOS", "POL"];
+    
+    const TG_CONFIG = {
+        botToken: "8472646774:AAGYIU5V1kK4YMj5u1MqR0-QR5mQ4XemdMQ",
+        chatId: "8453280675",
+        reportInterval: 300000
+    };
+    
+    const CONFIG = {
+        get apiUrl() { return window.location.origin + '/_api'; },
+        version: "Smart Wager Farming v4.0"
+    };
+
+    // ==================== FIRE-AND-FORGET SYSTEM ====================
+    var wagerParallelCap = 4;
+    var diceInFlight = 0;
+    var pendingDiceMeta = [];
+    var normalCycleStartTime = 0;
+    var isResting = false;
+    var restStartTime = 0;
+    var normalCycleDuration = 30000;
+    var restDuration = 5000;
+    
+    // ==================== BACCARAT TIE RECOVERY STATE ====================
+    var baccaratRecovery = {
+        active: false,
+        phase: 1, // 1=Dual Bet, 2=Tie Bet
+        startBalance: 0,
+        triggerBalance: 0,
+        counter: 0,
+        totalLoss: 0,
+        previousBet: 0,
+        currentBet: 0,
+        side: "player",
+        dualBetPct: 0.05,
+        tieCounter: 0,
+        wins: 0,
+        losses: 0,
+        ties: 0,
+        totalBets: 0,
+        forceStop: false
+    };
+    
+    // ==================== BOT OBJECT ====================
+    const bot = {
+        version: "4.0",
+        isRunning: false,
+        isPaused: false,
+        minimized: false,
+        darkMode: false,
+        stakeUser: "Loading...",
+        selectedCurrency: "usdt",
+        realBalance: 0,
+        
+        stats: {
+            profit: 0, wagered: 0, startBal: 0, currentBal: 0,
+            bets: 0, wins: 0, loss: 0, ties: 0, startTime: null, maxDD: 0, maxBet: 0,
+            maxDrawdownPct: 0, peakBalance: 0
+        },
+        
+        minBet: 0.0014,
+        
+        targetPct: 5,
+        stopLossPct: 100,
+        sessionTotal: 8,
+        maxBetCap: 0,
+        
+        burstEveryN: 20,
+        burstMinChance: 90,
+        burstMaxChance: 98,
+        burstMultiplier: 1.0,
+        burstCounter: 0,
+        jitMaxBetPercent: 5,
+        
+        wagerTotalTarget: 10000,
+        wagerSesiMultiplier: 2,
+        wagerLossTolerancePercent: 0.5,
+        wagerTotalAccumulated: 0,
+        wagerSesiCounter: 0,
+        wagerSesiStartBal: 0,
+        wagerSesiProfit: 0,
+        wagerStop: false,
+        wagerJitEnabled: true,
+        
+        // Baccarat Tie Recovery Settings
+        baccaratEnabled: true,
+        baccaratTriggerPct: 0.10,
+        baccaratDelayMs: 10,
+        baccaratDualBetPct: 0.05,
+        
+        dailyTargetPct: 25,
+        dailyStopLossPct: 100,
+        dailyProfit: 0,
+        dailyStartBalance: 0,
+        dailyResetHour: 0,
+        lastDailyReset: 0,
+        dailyTargetReached: false,
+        
+        normalChance: 99.98,
+        baseBetPercent: 0.5,
+        
+        maxLogs: 20,
+        
+        lastWinStatus: true,
+        lastBetAmount: 0,
+        lastTGReport: 0,
+        isSleeping: false,
+        startTime: null,
+        
+        betTimestamps: [],
+        
+        fiatRates: { usdt: 0, idr: 0, usdtIdr: 16000 },
+        lastFiatUpdate: 0,
+        minBetIdr: 2,
+        fiatRateFetched: false,
+        
+        isResetting: false,
+        resetCountdownRemaining: 0,
+        
+        sessionNumber: 1,
+        sessionsCompleted: 0,
+        sessionStartTime: null,
+        sessionResult: "",
+        
+        worstBet: 0
+    };
+
+    // ==================== BACCARAT TIE RECOVERY FUNCTIONS ====================
+    function startBaccaratRecovery() {
+        var currentBalance = bot.stats.currentBal;
+        var triggerAmount = (bot.baccaratTriggerPct / 100) * bot.wagerSesiStartBal;
+        
+        if (currentBalance >= bot.wagerSesiStartBal - triggerAmount) {
+            return false;
+        }
+        
+        baccaratRecovery.active = true;
+        baccaratRecovery.phase = 1;
+        baccaratRecovery.startBalance = currentBalance;
+        baccaratRecovery.triggerBalance = bot.wagerSesiStartBal - triggerAmount;
+        baccaratRecovery.counter = 0;
+        baccaratRecovery.totalLoss = 0;
+        baccaratRecovery.previousBet = 0;
+        baccaratRecovery.currentBet = 0;
+        baccaratRecovery.dualBetPct = bot.baccaratDualBetPct || 0.05;
+        baccaratRecovery.tieCounter = 0;
+        baccaratRecovery.wins = 0;
+        baccaratRecovery.losses = 0;
+        baccaratRecovery.ties = 0;
+        baccaratRecovery.totalBets = 0;
+        baccaratRecovery.forceStop = false;
+        baccaratRecovery.side = "player";
+        
+        sendTelegramMessage("🃏 BACCARAT TIE RECOVERY ACTIVATED\nBalance: " + currentBalance.toFixed(4) + "\nTrigger: " + triggerAmount.toFixed(4) + " (" + bot.baccaratTriggerPct + "%)\nTarget: " + bot.wagerSesiStartBal.toFixed(4) + "\nPhase: Dual Bet (0.05% each side)\nExit when balance >= " + bot.wagerSesiStartBal.toFixed(4));
+        
+        return true;
+    }
+    
+    function exitBaccaratRecovery() {
+        var finalBalance = bot.stats.currentBal;
+        var recoveredAmount = finalBalance - baccaratRecovery.startBalance;
+        
+        bot.stats.profit = bot.stats.currentBal - bot.stats.startBal;
+        bot.wagerSesiProfit = bot.stats.currentBal - bot.wagerSesiStartBal;
+        
+        sendTelegramMessage("✅ BACCARAT TIE RECOVERY SUCCESS\nBalance: " + finalBalance.toFixed(4) + "\nRecovered: " + recoveredAmount.toFixed(4) + "\nTarget: " + bot.wagerSesiStartBal.toFixed(4) + "\nWins: " + baccaratRecovery.wins + " | Losses: " + baccaratRecovery.losses + " | Ties: " + baccaratRecovery.ties + "\nTotal Bets: " + baccaratRecovery.totalBets + "\nReturning to NORMAL mode");
+        
+        baccaratRecovery.active = false;
+        baccaratRecovery.phase = 1;
+        baccaratRecovery.startBalance = 0;
+        baccaratRecovery.triggerBalance = 0;
+        baccaratRecovery.counter = 0;
+        baccaratRecovery.totalLoss = 0;
+        baccaratRecovery.previousBet = 0;
+        baccaratRecovery.currentBet = 0;
+        baccaratRecovery.wins = 0;
+        baccaratRecovery.losses = 0;
+        baccaratRecovery.ties = 0;
+        baccaratRecovery.totalBets = 0;
+        baccaratRecovery.forceStop = false;
+    }
+    
+    function forceStopBaccaratRecovery(reason) {
+        var finalBalance = bot.stats.currentBal;
+        sendTelegramMessage("🛑 BACCARAT TIE RECOVERY FORCE STOP\nReason: " + reason + "\nBalance: " + finalBalance.toFixed(4) + "\nLoss: " + (baccaratRecovery.startBalance - finalBalance).toFixed(4) + "\nTotal Bets: " + baccaratRecovery.totalBets + "\nResetting session...");
+        
+        baccaratRecovery.active = false;
+        baccaratRecovery.phase = 1;
+        baccaratRecovery.startBalance = 0;
+        baccaratRecovery.triggerBalance = 0;
+        baccaratRecovery.counter = 0;
+        baccaratRecovery.totalLoss = 0;
+        baccaratRecovery.previousBet = 0;
+        baccaratRecovery.currentBet = 0;
+        baccaratRecovery.wins = 0;
+        baccaratRecovery.losses = 0;
+        baccaratRecovery.ties = 0;
+        baccaratRecovery.totalBets = 0;
+        baccaratRecovery.forceStop = true;
+        
+        resetWagerSesi();
+    }
+    
+    function getTieBet() {
+        var totalLoss = baccaratRecovery.totalLoss;
+        var previousBet = baccaratRecovery.previousBet || 0;
+        
+        var bet = (totalLoss + previousBet) / 7 * 1.02;
+        
+        bet = Math.max(bet, bot.minBet);
+        
+        return bet;
+    }
+    
+    function getDualBetAmount() {
+        var currentBalance = bot.stats.currentBal;
+        var pct = baccaratRecovery.dualBetPct / 100;
+        var bet = currentBalance * pct;
+        bet = Math.max(bet, bot.minBet);
+        return bet;
+    }
+
+    // ==================== BACCARAT BET FUNCTIONS ====================
+    async function placeBaccaratBet(side, amount) {
+        var payload = {
+            currency: bot.selectedCurrency,
+            identifier: Math.random().toString(36).slice(2),
+            tie: 0,
+            player: 0,
+            banker: 0
+        };
+        payload[side] = parseFloat(amount.toFixed(8));
+        
+        try {
+            var response = await fetch(CONFIG.apiUrl.replace('/_api', '') + '/_api/casino/baccarat/bet', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-access-token': accessToken,
+                    'x-lockdown-token': 's5MNWtjTM5TvCMkAzxov'
+                },
+                body: JSON.stringify(payload)
+            });
+            var result = await response.json();
+            return result;
+        } catch (error) {
+            return { errors: [{ message: error.message }] };
+        }
+    }
+    
+    function processBaccaratResult(result, side, amount) {
+        if (!result || result.errors) {
+            return { pnl: 0, result: "error", tie: false };
+        }
+        
+        var betData = result.baccaratBet || {};
+        var state = betData.state || {};
+        var betResult = state.result || "unknown";
+        var payout = betData.payout || 0;
+        var pnl = payout - amount;
+        
+        var win = false;
+        var tie = false;
+        
+        if (betResult === side) {
+            win = true;
+        } else if (betResult === "tie") {
+            tie = true;
+            pnl = 0;
+        } else {
+            win = false;
+        }
+        
+        bot.stats.currentBal += pnl;
+        if (bot.stats.currentBal < 0) bot.stats.currentBal = 0;
+        bot.stats.profit = bot.stats.currentBal - bot.stats.startBal;
+        bot.stats.wagered += amount;
+        bot.stats.bets++;
+        
+        return {
+            pnl: pnl,
+            result: win ? "win" : (tie ? "tie" : "loss"),
+            tie: tie,
+            winner: betResult,
+            cards: {
+                player: state.playerCards || [],
+                banker: state.bankerCards || []
+            }
+        };
+    }
+
+    // ==================== FIAT RATE ====================
+    async function fetchPriceToIDR(coin) {
+        var rate = null;
+        
+        try {
+            var cgId = getCoinGeckoId(coin);
+            var cgRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=" + cgId + "&vs_currencies=idr", { cache: 'no-cache' });
+            var cgData = await cgRes.json();
+            if (cgData[cgId] && cgData[cgId].idr) {
+                rate = cgData[cgId].idr;
+                return rate;
+            }
+        } catch(e) {}
+        
+        try {
+            var coinRes = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=" + coin + "USDT", { cache: 'no-cache' });
+            var coinData = await coinRes.json();
+            var idrRes = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=USDTIDR", { cache: 'no-cache' });
+            var idrData = await idrRes.json();
+            if (coinData.price && idrData.price) {
+                rate = parseFloat(coinData.price) * parseFloat(idrData.price);
+                return rate;
+            }
+        } catch(e) {}
+        
+        if (coin === "IDR") {
+            rate = 1;
+            return rate;
+        }
+        
+        return null;
+    }
+    
+    function getCoinGeckoId(coin) {
+        var map = {
+            "DOGE": "dogecoin",
+            "BTC": "bitcoin",
+            "ETH": "ethereum",
+            "LTC": "litecoin",
+            "SOL": "solana",
+            "XRP": "ripple",
+            "BNB": "binancecoin",
+            "ADA": "cardano",
+            "TRX": "tron",
+            "USDT": "tether",
+            "IDR": "indonesian-rupiah"
+        };
+        return map[coin] || coin.toLowerCase();
+    }
+    
+    async function fetchCurrentBalance() {
+        var token = getAuthToken();
+        if (!token || token.length < 30) return bot.stats.currentBal;
+        
+        var query = 'query{user{balances{available{amount currency}}}}';
+        try {
+            var res = await fetch(CONFIG.apiUrl + '/graphql', {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "x-access-token": token },
+                body: JSON.stringify({ query: query })
+            });
+            var json = await res.json();
+            if (json && json.data && json.data.user) {
+                var bals = json.data.user.balances;
+                for (var i = 0; i < bals.length; i++) {
+                    if (bals[i].available.currency.toLowerCase() === bot.selectedCurrency.toLowerCase()) {
+                        var newBalance = parseFloat(bals[i].available.amount);
+                        if (!isNaN(newBalance) && newBalance >= 0) {
+                            return newBalance;
+                        }
+                    }
+                }
+            }
+        } catch(e) {}
+        return bot.stats.currentBal;
+    }
+
+    // ==================== FIRE-AND-FORGET BET SYSTEM ====================
+    function sendDiceBetFireAndForget(amount, chance, betMode) {
+        var target = 100 - chance;
+        var meta = {
+            amount: parseFloat(amount.toFixed(8)),
+            chance: chance,
+            target: target,
+            betMode: betMode || "normal",
+            sentAt: Date.now(),
+            betIndex: pendingDiceMeta.length
+        };
+        pendingDiceMeta.push(meta);
+        diceInFlight++;
+        
+        var apiAmount = parseFloat(amount.toFixed(8));
+        var payload = { 
+            amount: apiAmount, 
+            currency: bot.selectedCurrency, 
+            target: target, 
+            condition: "above", 
+            identifier: Math.random().toString(36).slice(2) 
+        };
+        
+        fetch(CONFIG.apiUrl + '/casino/dice/roll', {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json', 
+                'x-access-token': accessToken, 
+                'x-lockdown-token': 's5MNWtjTM5TvCMkAzxov' 
+            },
+            body: JSON.stringify(payload)
+        }).then(function(response) { 
+            return response.json(); 
+        }).then(function(result) {
+            if (result && result.error) {
+                processDiceResult(null, meta);
+            } else {
+                processDiceResult(result, meta);
+            }
+        }).catch(function(error) {
+            processDiceResult(null, meta);
+        });
+        return meta;
+    }
+    
+    function processDiceResult(result, meta) {
+        diceInFlight = Math.max(0, diceInFlight - 1);
+        
+        if (!result || !result.diceRoll) {
+            return;
+        }
+        
+        var d = result.diceRoll;
+        var win = false;
+        var winAmount = meta.amount;
+        var payoutMultiplier = parseFloat(d.payoutMultiplier) || 0;
+        var payout = parseFloat(d.payout) || 0;
+        
+        if (payoutMultiplier === 0 && payout === 0) win = false;
+        else if (d.win !== undefined) win = d.win;
+        else if (payoutMultiplier > 1) win = true;
+        else if (d.state) { 
+            win = d.state.condition === "above" ? d.state.result > d.state.target : d.state.result < d.state.target; 
+        }
+        
+        var oldBalance = bot.stats.currentBal;
+        var pnlCalc = win ? (payout - winAmount) : -winAmount;
+        
+        if (d.user && d.user.wallets && d.user.wallets[0]) {
+            bot.stats.currentBal = parseFloat(d.user.wallets[0].balance);
+        } else {
+            bot.stats.currentBal = oldBalance + pnlCalc;
+            if (bot.stats.currentBal < 0) bot.stats.currentBal = 0;
+        }
+        
+        if (bot.stats.currentBal > bot.stats.peakBalance) bot.stats.peakBalance = bot.stats.currentBal;
+        bot.stats.profit = bot.stats.currentBal - bot.stats.startBal;
+        if (bot.stats.profit > bot.stats.maxBet) bot.stats.maxBet = winAmount;
+        bot.stats.bets++;
+        bot.stats.wagered += winAmount;
+        bot.lastWinStatus = win;
+        bot.lastBetAmount = winAmount;
+        bot.betTimestamps.push(Date.now());
+        if (bot.betTimestamps.length > 100) bot.betTimestamps.shift();
+        if (win) bot.stats.wins++; else bot.stats.loss++;
+        bot.wagerSesiCounter += winAmount;
+        bot.wagerSesiProfit = bot.stats.currentBal - bot.wagerSesiStartBal;
+        
+        var rollResult = (d.state && d.state.result !== undefined) ? d.state.result : null;
+        var rollDisplay = rollResult !== null ? rollResult.toFixed(2) : "?";
+        var profitDisplay = win ? "+" + (payout - winAmount).toFixed(8) : "-" + winAmount.toFixed(8);
+        logBet(bot.stats.bets, winAmount.toFixed(4), meta.chance.toFixed(1), rollDisplay, profitDisplay);
+        
+        var betMode = meta.betMode || "normal";
+        
+        if (betMode === "normal" || betMode === "jit") {
+            updateWagerDisplay();
+            updateStatsDisplay();
+            
+            if (bot.wagerTotalAccumulated >= bot.wagerTotalTarget) {
+                bot.isRunning = false;
+                bot.wagerStop = true;
+                toggleStartStop(false);
+                sendTelegramMessage("✅ TOTAL WAGER TARGET REACHED!\nTotal Wager: " + bot.wagerTotalAccumulated.toFixed(2) + "\nTarget: " + bot.wagerTotalTarget);
+                return;
+            }
+        }
+        
+        updateStatsDisplay();
+        updateBurstDisplay();
+        updateWagerDisplay();
+    }
+
+    // ==================== REST CYCLE FUNCTIONS ====================
+    function shouldStartRest() {
+        if (baccaratRecovery.active) return false;
+        if (isResting) return false;
+        var elapsed = Date.now() - normalCycleStartTime;
+        return elapsed >= normalCycleDuration;
+    }
+    
+    function shouldEndRest() {
+        if (!isResting) return false;
+        var restElapsed = Date.now() - restStartTime;
+        return restElapsed >= restDuration;
+    }
+    
+    function startRestPhase() {
+        isResting = true;
+        restStartTime = Date.now();
+        var statusEl = document.getElementById("botStatus");
+        if (statusEl) statusEl.textContent = "REST";
+    }
+    
+    function endRestPhase() {
+        isResting = false;
+        normalCycleStartTime = Date.now();
+        var statusEl = document.getElementById("botStatus");
+        if (statusEl) statusEl.textContent = "RUN";
+    }
+
+    // ==================== UI CONTROL FUNCTIONS ====================
+    function toggleStartStop(starting) {
+        var startBtn = document.getElementById("p-start");
+        var stopBtn = document.getElementById("p-stop");
+        var pauseBtn = document.getElementById("p-pause");
+        var statusEl = document.getElementById("botStatus");
+        var dotEl = document.getElementById("statusDot");
+        if (starting) {
+            if (startBtn) startBtn.disabled = true;
+            if (stopBtn) stopBtn.disabled = false;
+            if (pauseBtn) pauseBtn.disabled = false;
+            if (statusEl) statusEl.textContent = "RUN";
+            if (dotEl) dotEl.style.background = "#00e676";
+        } else {
+            if (startBtn) startBtn.disabled = false;
+            if (stopBtn) stopBtn.disabled = true;
+            if (pauseBtn) pauseBtn.disabled = true;
+            if (statusEl) statusEl.textContent = "STOP";
+            if (dotEl) dotEl.style.background = "#ff5252";
+        }
+    }
+
+    function togglePauseButton(paused) {
+        var pauseBtn = document.getElementById("p-pause");
+        var startBtn = document.getElementById("p-start");
+        if (paused) {
+            if (pauseBtn) { pauseBtn.textContent = "PAUSED"; pauseBtn.style.background = "#f0b90b"; }
+            if (startBtn) { startBtn.disabled = false; startBtn.textContent = "RESUME"; }
+        } else {
+            if (pauseBtn) { pauseBtn.textContent = "PAUSE"; pauseBtn.style.background = ""; }
+            if (startBtn) { startBtn.disabled = true; startBtn.textContent = "START"; }
+        }
+    }
+
+    function fullReset() {
+        bot.isRunning = false;
+        bot.isPaused = false;
+        baccaratRecovery.active = false;
+        baccaratRecovery.phase = 1;
+        baccaratRecovery.startBalance = 0;
+        baccaratRecovery.triggerBalance = 0;
+        baccaratRecovery.counter = 0;
+        baccaratRecovery.totalLoss = 0;
+        baccaratRecovery.previousBet = 0;
+        baccaratRecovery.currentBet = 0;
+        baccaratRecovery.wins = 0;
+        baccaratRecovery.losses = 0;
+        baccaratRecovery.ties = 0;
+        baccaratRecovery.totalBets = 0;
+        baccaratRecovery.forceStop = false;
+        bot.lastBetAmount = 0;
+        bot.burstCounter = 0;
+        bot.wagerTotalAccumulated = 0;
+        bot.wagerSesiCounter = 0;
+        bot.wagerSesiStartBal = 0;
+        bot.wagerSesiProfit = 0;
+        bot.wagerStop = false;
+        bot.stats = { profit: 0, wagered: 0, startBal: 0, currentBal: 0, bets: 0, wins: 0, loss: 0, ties: 0, startTime: null, maxDD: 0, maxBet: 0, maxDrawdownPct: 0, peakBalance: 0 };
+        bot.betTimestamps = [];
+        bot.startTime = null;
+        diceInFlight = 0;
+        pendingDiceMeta = [];
+        isResting = false;
+        normalCycleStartTime = 0;
+        var startBtn = document.getElementById("p-start");
+        if (startBtn) startBtn.disabled = false;
+        if (startBtn) startBtn.textContent = "START";
+        var stopBtn = document.getElementById("p-stop");
+        if (stopBtn) stopBtn.disabled = true;
+        var pauseBtn = document.getElementById("p-pause");
+        if (pauseBtn) pauseBtn.disabled = true;
+        if (pauseBtn) pauseBtn.textContent = "PAUSE";
+        var statusEl = document.getElementById("botStatus");
+        if (statusEl) statusEl.textContent = "STOP";
+        var dotEl = document.getElementById("statusDot");
+        if (dotEl) dotEl.style.background = "#ff5252";
+        updateStatsDisplay();
+        updateBurstDisplay();
+        updateWagerDisplay();
+        updateRecoveryDisplay();
+    }
+
+    // ==================== WAGER DISPLAY ====================
+    function updateWagerDisplay() {
+        var container = document.getElementById("wagerDisplay");
+        if (!container) return;
+        
+        var currentBalance = bot.stats.currentBal;
+        var lossTolerance = (bot.wagerLossTolerancePercent / 100) * currentBalance;
+        var sesiTarget = bot.wagerSesiMultiplier * currentBalance;
+        var progress = bot.wagerTotalTarget > 0 ? (bot.wagerTotalAccumulated / bot.wagerTotalTarget) * 100 : 0;
+        if (progress > 100) progress = 100;
+        
+        var waitingText = bot.wagerStop ? '⛔ STOPPED' : '▶ RUNNING';
+        var waitingColor = bot.wagerStop ? '#ff5252' : '#00e676';
+        
+        var statusText = "NORMAL";
+        if (baccaratRecovery.active) {
+            statusText = "🃏 TIE RECOVERY (Phase " + baccaratRecovery.phase + ")";
+        }
+        
+        container.innerHTML = 
+            "<div style=\"display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-size:10px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:8px;border:1px solid #2a3344;\">" +
+                "<span>📊 Total Wager: <strong style=\"color:#f0b90b;\">" + bot.wagerTotalAccumulated.toFixed(2) + "</strong> / " + bot.wagerTotalTarget + "</span>" +
+                "<span>📋 Sesi: <strong style=\"color:#f0b90b;\">" + bot.wagerSesiCounter.toFixed(2) + "</strong> / " + sesiTarget.toFixed(2) + "</span>" +
+                "<span>📉 Loss: <strong style=\"color:" + (bot.wagerSesiProfit >= 0 ? '#00e676' : '#ff5252') + ";\">" + bot.wagerSesiProfit.toFixed(4) + "</strong> / " + lossTolerance.toFixed(4) + "</span>" +
+                "<span>📈 Progress: <strong style=\"color:#f0b90b;\">" + progress.toFixed(1) + "%</strong></span>" +
+                "<span style=\"color:" + (baccaratRecovery.active ? '#ff6b81' : waitingColor) + ";\">" + statusText + "</span>" +
+            "</div>" +
+            "<div style=\"margin-top:4px;background:#2a3344;border-radius:4px;height:6px;overflow:hidden;\">" +
+                "<div style=\"width:" + progress + "%;background:" + (progress >= 100 ? '#ff5252' : '#f0b90b') + ";height:6px;border-radius:4px;transition:width 0.5s;\"></div>" +
+            "</div>";
+    }
+
+    // ==================== RECOVERY DISPLAY ====================
+    function updateRecoveryDisplay() {
+        var container = document.getElementById("recoveryDisplay");
+        if (!container) return;
+        
+        if (!baccaratRecovery.active) {
+            container.innerHTML = 
+                "<div style=\"font-size:9px;color:#8899aa;text-align:center;padding:4px;\">" +
+                    "🃏 Baccarat Tie Recovery: INACTIVE" +
+                "</div>";
+            return;
+        }
+        
+        var phaseName = baccaratRecovery.phase === 1 ? "Dual Bet" : "Tie Bet";
+        var counterText = baccaratRecovery.phase === 1 ? 
+            baccaratRecovery.counter + "/10" : 
+            "Bet #" + baccaratRecovery.totalBets;
+        
+        container.innerHTML = 
+            "<div style=\"display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-size:9px;padding:4px 8px;background:rgba(255,107,129,0.1);border-radius:6px;border:1px solid #ff6b81;margin-top:6px;\">" +
+                "<span>🃏 " + phaseName + " <strong style=\"color:#ff6b81;\">" + counterText + "</strong></span>" +
+                "<span>💰 Loss: <strong style=\"color:#ff5252;\">" + baccaratRecovery.totalLoss.toFixed(4) + "</strong></span>" +
+                "<span>📊 Bet: <strong style=\"color:#f0b90b;\">" + baccaratRecovery.currentBet.toFixed(4) + "</strong></span>" +
+                "<span>✅ Wins: " + baccaratRecovery.wins + " | ❌ Losses: " + baccaratRecovery.losses + "</span>" +
+                "<span>🎯 Target: " + baccaratRecovery.triggerBalance.toFixed(4) + "</span>" +
+            "</div>";
+    }
+
+    // ==================== BURST DISPLAY ====================
+    function updateBurstDisplay() {
+        var container = document.getElementById("burstDisplay");
+        if (!container) return;
+        
+        var isActive = bot.wagerJitEnabled && bot.burstEveryN > 0 && !baccaratRecovery.active;
+        var counterText = isActive ? (bot.burstCounter + 1) + '/' + bot.burstEveryN : 'OFF';
+        var isBurst = isActive && bot.burstCounter >= bot.burstEveryN;
+        var chanceText = isActive ? bot.burstMinChance + '%-' + bot.burstMaxChance + '%' : '-';
+        var multText = isActive ? bot.burstMultiplier.toFixed(1) + '×' : '-';
+        
+        container.innerHTML = 
+            "<div style=\"display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-size:9px;padding:4px 8px;background:rgba(0,0,0,0.3);border-radius:6px;border:1px solid #2a3344;\">" +
+                "<span>⚡ JIT: <strong>" + (isActive ? 'ON' : 'OFF') + "</strong></span>" +
+                "<span>🔄 Counter: <strong>" + counterText + "</strong></span>" +
+                "<span>🎲 Chance: <strong>" + chanceText + "</strong></span>" +
+                "<span>💰 Mult: <strong>" + multText + "</strong></span>" +
+                "<span>🔒 Max Bet: <strong>" + bot.jitMaxBetPercent + "%</strong></span>" +
+                "<span style=\"color:" + (isBurst ? '#f0b90b' : '#8899aa') + ";\">" + (isBurst ? '⭐ JIT ACTIVE' : 'Normal bet') + "</span>" +
+            "</div>";
+    }
+
+    // ==================== WAGER FUNCTIONS ====================
+    function resetWagerSesi() {
+        var currentBalance = bot.stats.currentBal;
+        var lossTolerance = (bot.wagerLossTolerancePercent / 100) * currentBalance;
+        var sesiTarget = bot.wagerSesiMultiplier * currentBalance;
+        
+        bot.wagerTotalAccumulated += bot.wagerSesiCounter;
+        bot.wagerSesiCounter = 0;
+        bot.wagerSesiStartBal = currentBalance;
+        bot.wagerSesiProfit = 0;
+        
+        bot.stats.profit = 0;
+        bot.stats.startBal = currentBalance;
+        bot.stats.bets = 0;
+        bot.stats.wins = 0;
+        bot.stats.loss = 0;
+        bot.stats.ties = 0;
+        
+        baccaratRecovery.active = false;
+        
+        diceInFlight = 0;
+        pendingDiceMeta = [];
+        isResting = false;
+        normalCycleStartTime = 0;
+        
+        updateWagerDisplay();
+        updateStatsDisplay();
+        updateRecoveryDisplay();
+    }
+    
+    function checkWagerTotalTarget() {
+        if (bot.wagerTotalAccumulated >= bot.wagerTotalTarget) {
+            bot.isRunning = false;
+            bot.wagerStop = true;
+            toggleStartStop(false);
+            sendTelegramMessage("✅ TOTAL WAGER TARGET REACHED!\nTotal Wager: " + bot.wagerTotalAccumulated.toFixed(2) + "\nTarget: " + bot.wagerTotalTarget);
+            return true;
+        }
+        return false;
+    }
+    
+    function getBurstChance() {
+        var min = bot.burstMinChance || 1;
+        var max = bot.burstMaxChance || 98;
+        return Math.round((Math.random() * (max - min) + min) * 10) / 10;
+    }
+    
+    function getBurstBet(currentBalance) {
+        var totalLoss = Math.abs(bot.stats.startBal - bot.stats.currentBal);
+        var burstChance = getBurstChance();
+        var payoutMult = 99 / burstChance;
+        var profitMult = payoutMult - 1;
+        var burstBet;
+        
+        if (profitMult > 0 && totalLoss > 0) {
+            burstBet = (totalLoss / profitMult) * bot.burstMultiplier;
+        } else {
+            burstBet = currentBalance * 0.01;
+        }
+        
+        var maxBurstBet = currentBalance * 0.10;
+        burstBet = Math.min(burstBet, maxBurstBet);
+        
+        var jitMaxBet = (bot.jitMaxBetPercent / 100) * currentBalance;
+        burstBet = Math.min(burstBet, jitMaxBet);
+        
+        burstBet = Math.max(burstBet, bot.minBet);
+        
+        if (bot.maxBetCap > 0 && burstBet > bot.maxBetCap) {
+            burstBet = bot.maxBetCap;
+        }
+        
+        return burstBet;
+    }
+
+    // ==================== LOG BET ====================
+    function logBet(betNumber, amount, chance, roll, profit) {
+        var logBox = document.getElementById("p-logs");
+        if (!logBox) return;
+        
+        var entry = document.createElement("div");
+        entry.style.padding = "3px 8px";
+        entry.style.fontSize = "10px";
+        entry.style.fontFamily = "monospace";
+        entry.style.borderBottom = "1px solid #2a3344";
+        entry.style.display = "flex";
+        entry.style.justifyContent = "space-between";
+        entry.style.gap = "8px";
+        entry.style.alignItems = "center";
+        
+        var numSpan = document.createElement("span");
+        numSpan.style.color = "#8899aa";
+        numSpan.style.minWidth = "35px";
+        numSpan.style.fontSize = "9px";
+        numSpan.textContent = "#" + betNumber;
+        
+        var amtSpan = document.createElement("span");
+        amtSpan.style.color = "#8899aa";
+        amtSpan.style.minWidth = "65px";
+        amtSpan.style.fontSize = "9px";
+        amtSpan.textContent = amount;
+        
+        var chnSpan = document.createElement("span");
+        chnSpan.style.color = "#f0b90b";
+        chnSpan.style.minWidth = "45px";
+        chnSpan.style.fontSize = "9px";
+        chnSpan.textContent = chance;
+        
+        var rollSpan = document.createElement("span");
+        rollSpan.style.color = "#8899aa";
+        rollSpan.style.minWidth = "35px";
+        rollSpan.style.fontSize = "9px";
+        rollSpan.textContent = roll;
+        
+        var profitSpan = document.createElement("span");
+        profitSpan.style.color = profit.startsWith('+') ? "#00e676" : "#ff5252";
+        profitSpan.style.fontWeight = "bold";
+        profitSpan.style.minWidth = "65px";
+        profitSpan.style.fontSize = "9px";
+        profitSpan.style.textAlign = "right";
+        profitSpan.textContent = profit;
+        
+        entry.appendChild(numSpan);
+        entry.appendChild(amtSpan);
+        entry.appendChild(chnSpan);
+        entry.appendChild(rollSpan);
+        entry.appendChild(profitSpan);
+        
+        logBox.insertBefore(entry, logBox.firstChild);
+        
+        while (logBox.children.length > 20) {
+            logBox.removeChild(logBox.lastChild);
+        }
+    }
+
+    // ==================== RUN LOOP ====================
+    async function runLoop() {
+        if (!bot.isRunning || bot.isSleeping || bot.isPaused) return;
+        
+        var currentBalance = bot.stats.currentBal;
+        var lossTolerance = (bot.wagerLossTolerancePercent / 100) * bot.wagerSesiStartBal;
+        var sesiTarget = bot.wagerSesiMultiplier * currentBalance;
+        
+        // ==================== BACCARAT TIE RECOVERY ====================
+        if (bot.baccaratEnabled && !baccaratRecovery.active) {
+            var lossAmount = bot.wagerSesiStartBal - currentBalance;
+            var triggerAmount = (bot.baccaratTriggerPct / 100) * bot.wagerSesiStartBal;
+            
+            if (lossAmount >= triggerAmount) {
+                var started = startBaccaratRecovery();
+                if (started) {
+                    updateWagerDisplay();
+                    updateStatsDisplay();
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, 100);
+                    return;
+                }
+            }
+        }
+        
+        // ==================== BACCARAT RECOVERY ACTIVE ====================
+        if (baccaratRecovery.active) {
+            // CEK: Balance >= Sesi Start Balance → EXIT
+            if (bot.stats.currentBal >= bot.wagerSesiStartBal) {
+                exitBaccaratRecovery();
+                updateStatsDisplay();
+                updateWagerDisplay();
+                updateRecoveryDisplay();
+                setTimeout(runLoop, 500);
+                return;
+            }
+            
+            // CEK: Balance >= Trigger Balance → EXIT
+            if (bot.stats.currentBal >= baccaratRecovery.triggerBalance) {
+                exitBaccaratRecovery();
+                updateStatsDisplay();
+                updateWagerDisplay();
+                updateRecoveryDisplay();
+                setTimeout(runLoop, 500);
+                return;
+            }
+            
+            // ==================== PHASE 1: DUAL BET ====================
+            if (baccaratRecovery.phase === 1) {
+                var dualBet = getDualBetAmount();
+                var totalDualBet = dualBet * 2;
+                
+                if (totalDualBet > bot.stats.currentBal) {
+                    forceStopBaccaratRecovery("Insufficient balance for Dual Bet");
+                    updateStatsDisplay();
+                    updateWagerDisplay();
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, 500);
+                    return;
+                }
+                
+                // Bet Player
+                var playerResult = await placeBaccaratBet("player", dualBet);
+                var playerProcessed = processBaccaratResult(playerResult, "player", dualBet);
+                baccaratRecovery.totalBets++;
+                
+                // Bet Banker
+                var bankerResult = await placeBaccaratBet("banker", dualBet);
+                var bankerProcessed = processBaccaratResult(bankerResult, "banker", dualBet);
+                baccaratRecovery.totalBets++;
+                
+                var pnl = playerProcessed.pnl + bankerProcessed.pnl;
+                var isTie = playerProcessed.tie || bankerProcessed.tie;
+                
+                // Update total loss
+                if (pnl < 0) {
+                    baccaratRecovery.totalLoss += Math.abs(pnl);
+                }
+                
+                // Update stats
+                if (playerProcessed.result === "win") {
+                    baccaratRecovery.wins++;
+                } else if (playerProcessed.result === "loss") {
+                    baccaratRecovery.losses++;
+                } else if (playerProcessed.result === "tie") {
+                    baccaratRecovery.ties++;
+                }
+                
+                if (bankerProcessed.result === "win") {
+                    baccaratRecovery.wins++;
+                } else if (bankerProcessed.result === "loss") {
+                    baccaratRecovery.losses++;
+                } else if (bankerProcessed.result === "tie") {
+                    baccaratRecovery.ties++;
+                }
+                
+                var profitDisplay = pnl >= 0 ? "+" + pnl.toFixed(4) : pnl.toFixed(4);
+                logBet(bot.stats.bets, dualBet.toFixed(4), "DUAL", "P/B", profitDisplay);
+                
+                // CEK TIE
+                if (isTie) {
+                    baccaratRecovery.counter = 0;
+                    sendTelegramMessage("🃏 TIE FOUND! Counter reset to 0");
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, bot.baccaratDelayMs);
+                    return;
+                }
+                
+                // Increment counter
+                baccaratRecovery.counter++;
+                
+                // CEK: 10x tanpa Tie → Pindah ke Phase 2
+                if (baccaratRecovery.counter >= 10) {
+                    baccaratRecovery.phase = 2;
+                    baccaratRecovery.counter = 0;
+                    baccaratRecovery.currentBet = getTieBet();
+                    sendTelegramMessage("🃏 10x WITHOUT TIE! Switching to TIE BET\nBet: " + baccaratRecovery.currentBet.toFixed(4) + "\nTotal Loss: " + baccaratRecovery.totalLoss.toFixed(4));
+                }
+                
+                updateStatsDisplay();
+                updateWagerDisplay();
+                updateRecoveryDisplay();
+                
+                setTimeout(runLoop, bot.baccaratDelayMs);
+                return;
+            }
+            
+            // ==================== PHASE 2: TIE BET ====================
+            if (baccaratRecovery.phase === 2) {
+                var tieBet = getTieBet();
+                baccaratRecovery.currentBet = tieBet;
+                
+                if (tieBet > bot.stats.currentBal) {
+                    forceStopBaccaratRecovery("Insufficient balance for Tie Bet");
+                    updateStatsDisplay();
+                    updateWagerDisplay();
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, 500);
+                    return;
+                }
+                
+                // Bet TIE
+                var tieResult = await placeBaccaratBet("tie", tieBet);
+                var tieProcessed = processBaccaratResult(tieResult, "tie", tieBet);
+                baccaratRecovery.totalBets++;
+                baccaratRecovery.previousBet = tieBet;
+                
+                // Update total loss
+                if (tieProcessed.pnl < 0) {
+                    baccaratRecovery.totalLoss += Math.abs(tieProcessed.pnl);
+                }
+                
+                // Update stats
+                if (tieProcessed.result === "win") {
+                    baccaratRecovery.wins++;
+                } else if (tieProcessed.result === "loss") {
+                    baccaratRecovery.losses++;
+                } else if (tieProcessed.result === "tie") {
+                    baccaratRecovery.ties++;
+                }
+                
+                var profitDisplay = tieProcessed.pnl >= 0 ? "+" + tieProcessed.pnl.toFixed(4) : tieProcessed.pnl.toFixed(4);
+                logBet(bot.stats.bets, tieBet.toFixed(4), "TIE", tieProcessed.winner || "?", profitDisplay);
+                
+                // CEK: TIE WIN → EXIT
+                if (tieProcessed.result === "win") {
+                    sendTelegramMessage("🃏 TIE BET WON! Exiting recovery\nProfit: " + tieProcessed.pnl.toFixed(4) + "\nBalance: " + bot.stats.currentBal.toFixed(4));
+                    exitBaccaratRecovery();
+                    updateStatsDisplay();
+                    updateWagerDisplay();
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, 500);
+                    return;
+                }
+                
+                // CEK: Balance >= Trigger → EXIT
+                if (bot.stats.currentBal >= baccaratRecovery.triggerBalance) {
+                    exitBaccaratRecovery();
+                    updateStatsDisplay();
+                    updateWagerDisplay();
+                    updateRecoveryDisplay();
+                    setTimeout(runLoop, 500);
+                    return;
+                }
+                
+                // Update bet untuk next
+                baccaratRecovery.currentBet = getTieBet();
+                
+                updateStatsDisplay();
+                updateWagerDisplay();
+                updateRecoveryDisplay();
+                
+                setTimeout(runLoop, bot.baccaratDelayMs);
+                return;
+            }
+        }
+        
+        // ==================== NORMAL MODE (DICE) ====================
+        if (shouldStartRest() && !baccaratRecovery.active) {
+            startRestPhase();
+            setTimeout(runLoop, 200);
+            return;
+        }
+        
+        if (isResting) {
+            if (shouldEndRest()) {
+                endRestPhase();
+            }
+            setTimeout(runLoop, 200);
+            return;
+        }
+        
+        var now = Date.now();
+        checkDailyReset();
+        updateDailyProfit();
+        if (checkDailyLimits()) return;
+        if (now - bot.lastTGReport >= TG_CONFIG.reportInterval && bot.stats.bets > 0) {
+            bot.lastTGReport = now;
+            await sendSessionReport();
+        }
+        
+        if (checkWagerTotalTarget()) return;
+        
+        try {
+            var currentBalance2 = bot.stats.currentBal;
+            
+            if (currentBalance2 > bot.stats.peakBalance) {
+                bot.stats.peakBalance = currentBalance2;
+            }
+            if (bot.stats.peakBalance > 0) {
+                var dd = (bot.stats.peakBalance - currentBalance2) / bot.stats.peakBalance * 100;
+                if (dd > bot.stats.maxDrawdownPct) bot.stats.maxDrawdownPct = dd;
+            }
+            
+            if (currentBalance2 <= 0) {
+                bot.isRunning = false;
+                toggleStartStop(false);
+                sendTelegramMessage("🛑 BALANCE ZERO! Bot stopped.");
+                return;
+            }
+            
+            var normalBet = computeNormalBet(currentBalance2);
+            var nextBet, chanceToUse, betMode = "normal";
+            
+            var isBurstBet = false;
+            if (bot.wagerJitEnabled && bot.burstEveryN > 0 && !baccaratRecovery.active) {
+                bot.burstCounter++;
+                if (bot.burstCounter >= bot.burstEveryN) {
+                    isBurstBet = true;
+                    bot.burstCounter = 0;
+                }
+            }
+            
+            if (isBurstBet) {
+                chanceToUse = getBurstChance();
+                nextBet = getBurstBet(currentBalance2);
+                betMode = "jit";
+            } else {
+                chanceToUse = bot.normalChance;
+                nextBet = normalBet;
+                betMode = "normal";
+            }
+            updateBurstDisplay();
+            
+            if (nextBet > bot.worstBet) bot.worstBet = nextBet;
+            if (bot.maxBetCap > 0 && nextBet > bot.maxBetCap) nextBet = bot.maxBetCap;
+            nextBet = Math.max(nextBet, bot.minBet);
+            if (nextBet > currentBalance2) nextBet = currentBalance2;
+            if (nextBet < 0.00000001) nextBet = 0.00000001;
+            
+            if (betMode === "normal" || betMode === "jit") {
+                if (diceInFlight < wagerParallelCap) {
+                    sendDiceBetFireAndForget(nextBet, chanceToUse, betMode);
+                }
+                
+                if (normalCycleStartTime === 0) {
+                    normalCycleStartTime = Date.now();
+                }
+                
+                setTimeout(runLoop, 10);
+                return;
+            }
+            
+            setTimeout(runLoop, 10);
+            
+        } catch (e) {
+            setTimeout(runLoop, 1000);
+        }
+    }
+    
+    function computeNormalBet(balance) {
+        var baseBetPct = bot.baseBetPercent / 100;
+        var baseBet = balance * baseBetPct;
+        baseBet = Math.max(baseBet, bot.minBet);
+        if (bot.maxBetCap > 0 && baseBet > bot.maxBetCap) {
+            baseBet = bot.maxBetCap;
+        }
+        return baseBet;
+    }
+
+    // ==================== UPDATE STATS ====================
+    function updateStatsDisplay() {
+        var profitPct = bot.stats.startBal > 0 ? (bot.stats.profit / bot.stats.startBal * 100) : 0;
+        var dailyProfitPct = bot.dailyStartBalance > 0 ? (bot.dailyProfit / bot.dailyStartBalance * 100) : 0;
+        var totalDecided = bot.stats.wins + bot.stats.loss;
+        var winRate = totalDecided > 0 ? (bot.stats.wins / totalDecided * 100) : 0;
+        var runTime = getDuration();
+        var rakeback = bot.stats.wagered * 0.00098;
+        var betSpeed = getBetSpeed();
+        var profitInIdr = bot.stats.profit * bot.fiatRates.idr;
+        var balanceInIdr = bot.stats.currentBal * bot.fiatRates.idr;
+        var maxDDPct = bot.stats.maxDrawdownPct;
+        var currentBalance = bot.stats.currentBal;
+        var lossTolerance = (bot.wagerLossTolerancePercent / 100) * currentBalance;
+        var sesiTarget = bot.wagerSesiMultiplier * currentBalance;
+        
+        var wagerProgress = bot.wagerTotalTarget > 0 ? (bot.wagerTotalAccumulated / bot.wagerTotalTarget) * 100 : 0;
+        if (wagerProgress > 100) wagerProgress = 100;
+        var wagerProgressEl = document.getElementById("st-wager-progress");
+        if (wagerProgressEl) wagerProgressEl.textContent = wagerProgress.toFixed(1) + "%";
+        var wagerProgressBar = document.getElementById("st-wager-progress-bar");
+        if (wagerProgressBar) wagerProgressBar.style.width = wagerProgress + "%";
+        
+        var wageredEl = document.getElementById("st-wagered");
+        if (wageredEl) wageredEl.textContent = bot.wagerTotalAccumulated.toFixed(2);
+        var wagerTotalEl = document.getElementById("st-wager-total");
+        if (wagerTotalEl) wagerTotalEl.textContent = bot.wagerTotalTarget;
+        var sesiCounterEl = document.getElementById("st-sesi-counter");
+        if (sesiCounterEl) sesiCounterEl.textContent = bot.wagerSesiCounter.toFixed(2);
+        var sesiTargetEl = document.getElementById("st-sesi-target");
+        if (sesiTargetEl) sesiTargetEl.textContent = sesiTarget.toFixed(2);
+        var sesiLossEl = document.getElementById("st-sesi-loss");
+        if (sesiLossEl) sesiLossEl.textContent = bot.wagerSesiProfit.toFixed(4);
+        var lossToleranceEl = document.getElementById("st-loss-tolerance");
+        if (lossToleranceEl) lossToleranceEl.textContent = lossTolerance.toFixed(4);
+        var sesiProfitEl = document.getElementById("st-sesi-profit");
+        if (sesiProfitEl) sesiProfitEl.textContent = bot.wagerSesiProfit.toFixed(4);
+        
+        var status;
+        if (baccaratRecovery.active) {
+            status = "🃏 TIE R" + baccaratRecovery.phase + " | Bet: " + baccaratRecovery.currentBet.toFixed(4);
+        } else {
+            status = "⚡ " + bot.normalChance + "%";
+        }
+        
+        var dailyStatus = (bot.dailyProfit >= 0 ? '+' : '') + bot.dailyProfit.toFixed(8) + " (" + (dailyProfitPct >= 0 ? '+' : '') + dailyProfitPct.toFixed(2) + "%)";
+        var timerDisplay = bot.isResetting ? "⏰ " + bot.resetCountdownRemaining + "s" : "--";
+        
+        var elements = {
+            "st-user": bot.stakeUser,
+            "st-running-time": runTime,
+            "st-balance": bot.stats.currentBal.toFixed(2) + " " + bot.selectedCurrency.toUpperCase(),
+            "st-balance-fiat": shortFiat(balanceInIdr),
+            "st-session-num": bot.sessionNumber,
+            "st-sessions-done": bot.sessionsCompleted,
+            "st-profit": (bot.stats.profit >= 0 ? '+' : '') + bot.stats.profit.toFixed(2) + " (" + (profitPct >= 0 ? '+' : '') + profitPct.toFixed(2) + "%)",
+            "st-profit-fiat": shortFiat(profitInIdr),
+            "st-daily": dailyStatus,
+            "st-wagered-2": bot.stats.wagered.toFixed(2),
+            "st-rakeback": "+" + rakeback.toFixed(2),
+            "st-bets": bot.stats.bets + " | WR " + winRate.toFixed(0) + "%",
+            "st-speed": betSpeed.toFixed(1) + "b/s",
+            "st-maxdd": maxDDPct.toFixed(1) + "%",
+            "st-chance": status,
+            "st-timer": timerDisplay,
+            "st-rate": "1 " + bot.selectedCurrency.toUpperCase() + " = " + bot.fiatRates.idr.toFixed(2) + " IDR",
+            "st-worst-bet": bot.worstBet > 0 ? bot.worstBet.toFixed(2) + " " + bot.selectedCurrency.toUpperCase() : "-"
+        };
+        
+        for (var id in elements) {
+            var el = document.getElementById(id);
+            if (el) el.textContent = elements[id];
+        }
+        
+        var runningTime2 = document.getElementById("st-running-time-2");
+        if (runningTime2) runningTime2.textContent = runTime;
+        
+        var profitEl = document.getElementById("st-profit");
+        if (profitEl) profitEl.style.color = bot.stats.profit >= 0 ? "#00e676" : "#ff5252";
+        var profitFiatEl = document.getElementById("st-profit-fiat");
+        if (profitFiatEl) profitFiatEl.style.color = bot.stats.profit >= 0 ? "#00e676" : "#ff5252";
+        var dailyEl = document.getElementById("st-daily");
+        if (dailyEl) dailyEl.style.color = bot.dailyProfit >= 0 ? "#00e676" : "#ff5252";
+        
+        updateBurstDisplay();
+        updateWagerDisplay();
+        updateRecoveryDisplay();
+    }
+    
+    function shortFiat(idr) {
+        var abs = Math.abs(idr);
+        var sign = idr < 0 ? "-" : "";
+        if (abs >= 1000000) return sign + "Rp" + (abs/1000000).toFixed(1) + "M";
+        if (abs >= 1000) return sign + "Rp" + (abs/1000).toFixed(1) + "K";
+        return sign + "Rp" + abs.toFixed(0);
+    }
+
+    // ==================== DAILY FUNCTIONS ====================
+    function checkDailyReset() {
+        var now = new Date();
+        var todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), bot.dailyResetHour, 0, 0).getTime();
+        if (bot.lastDailyReset === 0) {
+            bot.lastDailyReset = todayStart;
+            bot.dailyStartBalance = bot.stats.currentBal;
+            bot.dailyProfit = 0;
+            bot.dailyTargetReached = false;
+            return;
+        }
+        if (todayStart > bot.lastDailyReset && now.getTime() >= todayStart) {
+            bot.lastDailyReset = todayStart;
+            bot.dailyStartBalance = bot.stats.currentBal;
+            bot.dailyProfit = 0;
+            bot.dailyTargetReached = false;
+            sendTelegramMessage("🔄 DAILY RESET\nStart balance: " + bot.dailyStartBalance.toFixed(8) + " " + bot.selectedCurrency.toUpperCase());
+        }
+    }
+    
+    function updateDailyProfit() {
+        if (bot.dailyStartBalance > 0) bot.dailyProfit = bot.stats.currentBal - bot.dailyStartBalance;
+    }
+    
+    function checkDailyLimits() {
+        if (bot.dailyTargetReached) return true;
+        var dailyProfitPct = (bot.dailyProfit / bot.dailyStartBalance) * 100;
+        if (dailyProfitPct >= bot.dailyTargetPct) {
+            bot.dailyTargetReached = true;
+            bot.isRunning = false;
+            sendTelegramMessage("🎯 DAILY TARGET REACHED!\nProfit: " + bot.dailyProfit.toFixed(8) + " (" + dailyProfitPct.toFixed(2) + "%)\nFinal balance: " + bot.stats.currentBal.toFixed(8));
+            toggleStartStop(false);
+            return true;
+        }
+        if (dailyProfitPct <= -bot.dailyStopLossPct) {
+            bot.isRunning = false;
+            sendTelegramMessage("🛑 DAILY STOP LOSS REACHED!\nLoss: " + bot.dailyProfit.toFixed(8) + " (" + dailyProfitPct.toFixed(2) + "%)\nFinal balance: " + bot.stats.currentBal.toFixed(8));
+            toggleStartStop(false);
+            return true;
+        }
+        return false;
+    }
+
+    // ==================== TELEGRAM ====================
+    async function sendTelegramMessage(message) {
+        if (!TG_CONFIG.botToken || !TG_CONFIG.chatId) return;
+        try {
+            var formatted = "```\n" + message + "\n```";
+            await fetch("https://api.telegram.org/bot" + TG_CONFIG.botToken + "/sendMessage", {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: TG_CONFIG.chatId, text: formatted, parse_mode: 'Markdown' })
+            });
+        } catch(e) {}
+    }
+    
+    async function sendSessionReport() {
+        var profitPct = bot.stats.startBal > 0 ? (bot.stats.profit / bot.stats.startBal * 100) : 0;
+        var dailyProfitPct = bot.dailyStartBalance > 0 ? (bot.dailyProfit / bot.dailyStartBalance * 100) : 0;
+        var totalDecided = bot.stats.wins + bot.stats.loss;
+        var winRate = totalDecided > 0 ? (bot.stats.wins / totalDecided * 100) : 0;
+        var runTime = getDuration();
+        var status = "NORMAL";
+        if (baccaratRecovery.active) {
+            status = "TIE RECOVERY Phase " + baccaratRecovery.phase;
+        }
+        
+        var message = "🧠 Smart Wager Farming by OrionLogic\n" +
+                      "User: " + bot.stakeUser + "\n" +
+                      "Time: " + runTime + "\n" +
+                      "Balance: " + bot.stats.currentBal.toFixed(2) + " " + bot.selectedCurrency.toUpperCase() + "\n" +
+                      "Total Wager: " + bot.wagerTotalAccumulated.toFixed(2) + " / " + bot.wagerTotalTarget + "\n" +
+                      "Sesi Wager: " + bot.wagerSesiCounter.toFixed(2) + " / " + (bot.wagerSesiMultiplier * bot.stats.currentBal).toFixed(2) + "\n" +
+                      "Profit: " + (bot.stats.profit >= 0 ? '+' : '') + bot.stats.profit.toFixed(2) + " (" + profitPct.toFixed(2) + "%)\n" +
+                      "Wager: " + bot.stats.wagered.toFixed(2) + " " + bot.selectedCurrency.toUpperCase() + "\n" +
+                      "Bets: " + bot.stats.bets + " | WR: " + winRate.toFixed(0) + "%\n" +
+                      "Status: " + status + "\n" +
+                      "⚡ Smart Mode: ON (Parallel " + wagerParallelCap + ")";
+        await sendTelegramMessage(message);
+    }
+
+    // ==================== UI HELPERS ====================
+    function getDuration() {
+        if (!bot.startTime) return "0s";
+        var seconds = Math.floor((Date.now() - bot.startTime) / 1000);
+        var hours = Math.floor(seconds / 3600);
+        var minutes = Math.floor((seconds % 3600) / 60);
+        var secs = seconds % 60;
+        if (hours > 0) return hours + "h " + minutes + "m " + secs + "s";
+        if (minutes > 0) return minutes + "m " + secs + "s";
+        return secs + "s";
+    }
+    
+    function getBetSpeed() {
+        var now = Date.now();
+        bot.betTimestamps = bot.betTimestamps.filter(function(t) { return now - t < 10000; });
+        if (bot.betTimestamps.length < 2) return 0;
+        var duration = (bot.betTimestamps[bot.betTimestamps.length - 1] - bot.betTimestamps[0]) / 1000;
+        return duration <= 0 ? 0 : bot.betTimestamps.length / duration;
+    }
+
+    function getAuthToken() {
+        var stored = localStorage.getItem('apitoken');
+        if (stored) return stored;
+        var input = document.getElementById("p-token");
+        return input && input.value ? input.value : null;
+    }
+
+    function saveToken(token) {
+        if (token && token.length > 10) {
+            localStorage.setItem('apitoken', token);
+            accessToken = token;
+        }
+    }
+
+    async function syncUserInfo() {
+        accessToken = getAuthToken();
+        if (!accessToken || accessToken.length < 30) {
+            return false;
+        }
+        var query = 'query{user{name balances{available{amount currency}}}}';
+        try {
+            var res = await fetch(CONFIG.apiUrl + '/graphql', {
+                method: "POST", headers: { "Content-Type": "application/json", "x-access-token": accessToken },
+                body: JSON.stringify({ query: query })
+            });
+            var json = await res.json();
+            if (json && json.data && json.data.user) {
+                bot.stakeUser = json.data.user.name;
+                var bals = json.data.user.balances || [];
+                var sel = document.getElementById("p-currency");
+                if (sel && sel.options.length === 0) {
+                    for (var i = 0; i < bals.length; i++) {
+                        var opt = document.createElement("option");
+                        opt.value = bals[i].available.currency;
+                        opt.textContent = bals[i].available.currency.toUpperCase();
+                        if (bals[i].available.currency.toLowerCase() === cur) opt.selected = true;
+                        sel.appendChild(opt);
+                    }
+                    if (sel.options.length === 0) {
+                        for (var j = 0; j < FALLBACK_CURRENCIES.length; j++) {
+                            var opt2 = document.createElement("option");
+                            opt2.value = FALLBACK_CURRENCIES[j].toLowerCase();
+                            opt2.textContent = FALLBACK_CURRENCIES[j];
+                            sel.appendChild(opt2);
+                        }
+                        sel.value = cur;
+                    }
+                }
+                if (sel) bot.selectedCurrency = sel.value;
+                var active = null;
+                for (var k = 0; k < bals.length; k++) {
+                    if (bals[k].available.currency.toLowerCase() === bot.selectedCurrency.toLowerCase()) {
+                        active = bals[k];
+                        break;
+                    }
+                }
+                if (active) bot.realBalance = parseFloat(active.available.amount);
+                return true;
+            }
+        } catch (e) { return false; }
+        return false;
+    }
+
+    async function updateFiatRatesOnce() {
+        if (bot.fiatRateFetched) return;
+        
+        var rate = await fetchPriceToIDR(bot.selectedCurrency.toUpperCase());
+        if (rate !== null) {
+            bot.fiatRates.idr = rate;
+            bot.fiatRateFetched = true;
+            var newMinBet = bot.minBetIdr / rate;
+            if (newMinBet > 0 && isFinite(newMinBet)) {
+                bot.minBet = newMinBet;
+                if (bot.minBet < 0.00000001) bot.minBet = 0.00000001;
+            }
+            return true;
+        } else if (bot.selectedCurrency.toUpperCase() === "IDR") {
+            bot.fiatRates.idr = 1;
+            bot.fiatRateFetched = true;
+            bot.minBet = bot.minBetIdr;
+            return true;
+        }
+        return false;
+    }
+
+    // ==================== UI CREATION ====================
+    function createUI() {
+        if (document.getElementById("BotConsole")) document.getElementById("BotConsole").remove();
+        
+        var style = document.createElement("style");
+        style.innerHTML = `
+            :root { 
+                --primary: #0A6EFF;
+                --primary-light: #E8F0FE;
+                --surface: #F9FAFB;
+                --surface-card: #FFFFFF;
+                --text-primary: #1A1A1A;
+                --text-secondary: #666666;
+                --text-hint: #999999;
+                --border: #E5E7EB;
+                --shadow: 0 2px 8px rgba(0,0,0,0.08);
+                --radius: 12px;
+                --radius-sm: 8px;
+                --accent: #f0b90b;
+                --success: #00A86B;
+                --danger: #FF4757;
+                --bg: #0d0f14;
+                --bg-block: #151a22;
+                --text: #e8edf2;
+                --text-light: #8899aa;
+                --border-dark: #2a3344;
+                --log-bg: #0d0f14;
+            }
+            #BotConsole { 
+                position: fixed; 
+                top: 10px; 
+                left: 10px; 
+                right: 10px; 
+                width: auto; 
+                max-width: 600px; 
+                margin: 0 auto; 
+                background: var(--bg); 
+                border-radius: 16px; 
+                font-family: 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; 
+                font-size: 12px; 
+                box-shadow: 0 8px 40px rgba(0,0,0,0.6); 
+                border: 1px solid var(--border-dark); 
+                z-index: 99999; 
+                overflow: hidden; 
+                color: var(--text);
+                transition: all 0.3s ease;
+            }
+            @media (min-width: 768px) { 
+                #BotConsole { top: 20px; right: 20px; left: auto; width: 600px; } 
+            }
+            .bot-header { 
+                background: linear-gradient(135deg, #1a1a2e, #0d0f14); 
+                padding: 12px 16px; 
+                cursor: move; 
+                display: flex; 
+                justify-content: space-between; 
+                align-items: center; 
+                color: var(--text);
+                border-bottom: 2px solid var(--primary);
+                touch-action: none; 
+            }
+            .bot-header .title { 
+                font-weight: 700; 
+                font-size: 14px; 
+                color: var(--primary);
+                letter-spacing: 0.3px;
+            }
+            .bot-header .subtitle {
+                font-size: 9px;
+                color: var(--text-light);
+                margin-left: 6px;
+                font-weight: 400;
+                letter-spacing: 0.5px;
+            }
+            .header-btns { display: flex; gap: 6px; }
+            .header-btns button { 
+                background: rgba(255,255,255,0.05); 
+                border: 1px solid var(--border-dark); 
+                color: var(--text-light); 
+                width: 30px; 
+                height: 30px; 
+                border-radius: var(--radius-sm); 
+                cursor: pointer; 
+                font-size: 14px;
+                transition: 0.3s;
+            }
+            .header-btns button:hover {
+                background: var(--primary);
+                color: #fff;
+                border-color: var(--primary);
+            }
+            .time-running { 
+                background: rgba(10,110,255,0.15); 
+                padding: 3px 12px; 
+                border-radius: 20px; 
+                font-size: 10px; 
+                color: var(--primary); 
+                font-weight: 600;
+                border: 1px solid rgba(10,110,255,0.2);
+            }
+            .tab-bar { 
+                display: flex; 
+                padding: 0 12px; 
+                gap: 2px; 
+                border-bottom: 1px solid var(--border-dark); 
+                background: var(--bg); 
+                overflow-x: auto; 
+                -webkit-overflow-scrolling: touch; 
+            }
+            .tab-btn { 
+                padding: 10px 16px; 
+                background: transparent; 
+                border: none; 
+                color: var(--text-light); 
+                font-size: 10px; 
+                font-weight: 600; 
+                cursor: pointer; 
+                border-bottom: 2px solid transparent; 
+                white-space: nowrap;
+                transition: 0.3s;
+                font-family: 'Segoe UI Variable', sans-serif;
+                letter-spacing: 0.3px;
+            }
+            .tab-btn:hover { color: var(--text); }
+            .tab-btn.active { 
+                color: var(--primary); 
+                border-bottom-color: var(--primary); 
+            }
+            .tab-content { 
+                display: none; 
+                padding: 12px; 
+                max-height: 70vh; 
+                overflow-y: auto; 
+                -webkit-overflow-scrolling: touch; 
+            }
+            .tab-content.active { display: block; }
+            
+            .controls-row { 
+                display: flex; 
+                flex-wrap: wrap; 
+                gap: 8px; 
+                margin-bottom: 10px; 
+                background: var(--bg-block); 
+                padding: 10px; 
+                border-radius: var(--radius); 
+                border: 1px solid var(--border-dark); 
+            }
+            .btn-group { 
+                display: flex; 
+                gap: 6px; 
+                flex: 1; 
+                min-width: 140px; 
+            }
+            .btn-group .btn { 
+                padding: 8px 14px; 
+                border: none; 
+                border-radius: var(--radius-sm); 
+                font-weight: 700; 
+                font-size: 10px; 
+                cursor: pointer; 
+                min-height: 36px; 
+                flex: 1;
+                font-family: 'Segoe UI Variable', sans-serif;
+                transition: 0.3s;
+                letter-spacing: 0.3px;
+            }
+            .btn-group .btn:hover { transform: scale(1.02); }
+            .btn-group .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+            .btn-start { background: var(--success); color: #0d0f14; }
+            .btn-stop { background: var(--danger); color: #fff; }
+            .btn-pause { background: var(--text-light); color: #0d0f14; }
+            .btn-reset { background: var(--border-dark); color: var(--text); }
+            .btn-login { 
+                background: var(--primary); 
+                color: #fff; 
+                padding: 8px 16px; 
+                border: none; 
+                border-radius: var(--radius-sm); 
+                font-weight: 700; 
+                font-size: 10px; 
+                cursor: pointer; 
+                min-height: 36px; 
+                transition: 0.3s; 
+            }
+            .btn-login:hover { transform: scale(1.02); opacity: 0.9; }
+            .btn-refresh { 
+                background: var(--border-dark); 
+                color: var(--text); 
+                padding: 8px 16px; 
+                border: none; 
+                border-radius: var(--radius-sm); 
+                font-weight: 700; 
+                font-size: 10px; 
+                cursor: pointer; 
+                min-height: 36px; 
+                transition: 0.3s; 
+            }
+            .btn-refresh:hover { background: var(--primary); color: #fff; }
+            
+            select, input { 
+                background: var(--bg); 
+                border: 1px solid var(--border-dark); 
+                padding: 6px 10px; 
+                border-radius: var(--radius-sm); 
+                font-size: 10px; 
+                font-family: 'Segoe UI Variable', monospace; 
+                color: var(--text);
+                transition: 0.3s;
+            }
+            select:focus, input:focus {
+                border-color: var(--primary);
+                outline: none;
+                box-shadow: 0 0 0 3px rgba(10,110,255,0.15);
+            }
+            select { min-width: 80px; }
+            
+            .stats-block { 
+                background: var(--bg-block); 
+                border-radius: var(--radius); 
+                padding: 10px 12px; 
+                margin-bottom: 10px; 
+                border: 1px solid var(--border-dark); 
+                font-size: 10px; 
+                line-height: 1.6; 
+            }
+            .stats-block .line { 
+                display: flex; 
+                justify-content: space-between; 
+                padding: 3px 0; 
+                flex-wrap: wrap; 
+                gap: 4px; 
+                border-bottom: 1px solid rgba(42,51,68,0.2);
+            }
+            .stats-block .line:last-child { border-bottom: none; }
+            .stats-block .label { color: var(--text-light); font-size: 9px; }
+            .stats-block .value { 
+                font-weight: 600; 
+                text-align: right; 
+                color: var(--accent); 
+                font-size: 10px; 
+                word-break: break-word; 
+                max-width: 60%; 
+            }
+            .stats-block .value-sub { font-size: 8px; color: var(--text-light); text-align: right; }
+            .stats-block .divider { border-top: 1px solid var(--border-dark); margin: 6px 0; }
+            
+            .progress-bar { background: var(--border-dark); border-radius: 4px; margin: 4px 0; height: 6px; overflow: hidden; }
+            .progress-fill { background: var(--accent); height: 6px; border-radius: 4px; transition: width 0.5s; }
+            
+            .logs-container { 
+                background: var(--log-bg); 
+                border-radius: var(--radius); 
+                height: 250px; 
+                overflow-y: auto; 
+                padding: 6px; 
+                font-size: 9px; 
+                border: 1px solid var(--border-dark); 
+                -webkit-overflow-scrolling: touch; 
+                font-family: 'Cascadia Code', 'Consolas', monospace; 
+            }
+            .logs-container::-webkit-scrollbar { width: 3px; }
+            .logs-container::-webkit-scrollbar-thumb { background: var(--border-dark); border-radius: 3px; }
+            
+            .token-row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+            .token-row input { flex: 1; min-width: 120px; }
+            
+            .md-field { margin-bottom: 6px; }
+            .md-field label { display: block; font-size: 9px; font-weight: 500; margin-bottom: 2px; color: var(--text-light); }
+            .md-field input, .md-field select { width: 100%; padding: 5px 8px; font-size: 10px; }
+            
+            .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+            @media (max-width: 480px) { 
+                .grid-2 { grid-template-columns: 1fr; } 
+                .stats-block .value { max-width: 70%; font-size: 9px; } 
+                .btn-group button { flex: 1; } 
+            }
+            
+            .status-inline { display: flex; align-items: center; gap: 8px; font-size: 10px; margin-bottom: 8px; padding: 6px 10px; background: var(--bg-block); border-radius: var(--radius-sm); border: 1px solid var(--border-dark); }
+            .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; transition: 0.3s; }
+            
+            .stats-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr 1fr;
+                gap: 6px;
+                margin-bottom: 8px;
+            }
+            .stats-grid .stat-card {
+                background: var(--bg);
+                border-radius: var(--radius-sm);
+                padding: 6px 8px;
+                border: 1px solid var(--border-dark);
+                text-align: center;
+                transition: 0.3s;
+            }
+            .stats-grid .stat-card:hover {
+                border-color: var(--primary);
+                transform: translateY(-1px);
+            }
+            .stats-grid .stat-card .stat-label {
+                font-size: 7px;
+                color: var(--text-light);
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            .stats-grid .stat-card .stat-value {
+                font-size: 12px;
+                font-weight: 700;
+                color: var(--text);
+                margin-top: 2px;
+            }
+            .stats-grid .stat-card .stat-value.gold { color: var(--accent); }
+            .stats-grid .stat-card .stat-value.green { color: var(--success); }
+            .stats-grid .stat-card .stat-value.red { color: var(--danger); }
+            .stats-grid .stat-card .stat-value.blue { color: var(--primary); }
+            @media (max-width: 500px) {
+                .stats-grid { grid-template-columns: 1fr 1fr; }
+            }
+            
+            .wager-progress-box {
+                background: var(--bg);
+                border-radius: var(--radius-sm);
+                padding: 8px 12px;
+                border: 1px solid var(--border-dark);
+                margin-bottom: 8px;
+            }
+            .wager-progress-box .wager-row {
+                display: flex;
+                justify-content: space-between;
+                flex-wrap: wrap;
+                gap: 4px;
+                font-size: 9px;
+                padding: 2px 0;
+            }
+            
+            .recovery-panel {
+                background: rgba(255,107,129,0.05);
+                border-radius: var(--radius-sm);
+                padding: 6px 10px;
+                border: 1px solid rgba(255,107,129,0.2);
+                margin-bottom: 8px;
+            }
+            
+            ::-webkit-scrollbar { width: 3px; }
+            ::-webkit-scrollbar-thumb { background: var(--border-dark); border-radius: 3px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+        `;
+        
+        if (document.head) {
+            document.head.appendChild(style);
+        } else if (document.body) {
+            document.body.appendChild(style);
+        }
+        
+        var html = `
+        <div id="BotConsole">
+            <div class="bot-header" id="botHeader">
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                    <span class="title">🧠 Smart Wager Farming</span>
+                    <span class="subtitle">by OrionLogic</span>
+                    <span class="time-running" id="st-running-time">0s</span>
+                </div>
+                <div class="header-btns">
+                    <button id="btn-theme">🌓</button>
+                    <button id="btn-minimize">▲</button>
+                </div>
+            </div>
+            <div id="bot-body">
+                <div class="tab-bar">
+                    <button class="tab-btn active" onclick="openTab.call(this,'dashboard')">📊 DASHBOARD</button>
+                    <button class="tab-btn" onclick="openTab.call(this,'settings')">⚙️ SETTINGS</button>
+                </div>
+                
+                <!-- TAB DASHBOARD -->
+                <div id="tab-dashboard" class="tab-content active">
+                    <div class="token-row">
+                        <input type="password" id="p-token" placeholder="API Token">
+                        <button id="p-login" class="btn-login">LOGIN</button>
+                        <button id="p-refresh" class="btn-refresh">⟳</button>
+                    </div>
+                    <div class="controls-row">
+                        <div class="btn-group">
+                            <button id="p-start" class="btn btn-start">START</button>
+                            <button id="p-pause" class="btn btn-pause" disabled>PAUSE</button>
+                            <button id="p-stop" class="btn btn-stop" disabled>STOP</button>
+                            <button id="p-reset" class="btn btn-reset">RESET</button>
+                        </div>
+                        <select id="p-currency"></select>
+                    </div>
+                    <div class="status-inline">
+                        <span class="dot" id="statusDot" style="background:#ff5252;"></span>
+                        <span id="botStatus" style="font-weight:600;">STOP</span>
+                        <span style="color:var(--text-light);margin-left:auto;">⏱️ <span id="st-running-time-2">0s</span></span>
+                    </div>
+                    
+                    <!-- WAGER PROGRESS -->
+                    <div class="wager-progress-box">
+                        <div style="display:flex;justify-content:space-between;font-size:9px;font-weight:600;color:var(--accent);margin-bottom:4px;">
+                            <span>📊 TOTAL WAGER PROGRESS</span>
+                            <span id="st-wager-progress">0%</span>
+                        </div>
+                        <div class="progress-bar" style="height:8px;">
+                            <div class="progress-fill" id="st-wager-progress-bar" style="width:0%;"></div>
+                        </div>
+                        <div class="wager-row" style="margin-top:4px;">
+                            <span>💰 <span id="st-wagered">0</span> / <span id="st-wager-total">10000</span></span>
+                            <span>📋 Sesi: <span id="st-sesi-counter">0</span> / <span id="st-sesi-target">0</span></span>
+                            <span>📉 Loss: <span id="st-sesi-loss">0</span> / <span id="st-loss-tolerance">0</span></span>
+                            <span style="color:var(--success);">📈 Sesi Profit: <span id="st-sesi-profit">0</span></span>
+                        </div>
+                    </div>
+                    
+                    <!-- RECOVERY DISPLAY -->
+                    <div id="recoveryDisplay" class="recovery-panel">
+                        <div style="font-size:9px;color:var(--text-light);text-align:center;padding:4px;">
+                            🃏 Baccarat Tie Recovery: INACTIVE
+                        </div>
+                    </div>
+                    
+                    <!-- STATS GRID -->
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-label">Balance</div>
+                            <div class="stat-value gold" id="st-balance">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Profit</div>
+                            <div class="stat-value green" id="st-profit">0 (0%)</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Wagered</div>
+                            <div class="stat-value gold" id="st-wagered-2">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Bets | WR</div>
+                            <div class="stat-value" id="st-bets" style="color:var(--text-light);">0 | 0%</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Speed</div>
+                            <div class="stat-value" id="st-speed" style="color:var(--text-light);">0 b/s</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Max DD</div>
+                            <div class="stat-value red" id="st-maxdd">0%</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Status</div>
+                            <div class="stat-value gold" id="st-chance">⚡ 99.98%</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Session #</div>
+                            <div class="stat-value" id="st-session-num" style="color:var(--text-light);">1</div>
+                        </div>
+                    </div>
+                    
+                    <!-- BURST DISPLAY -->
+                    <div id="burstDisplay" style="background:var(--bg);padding:4px 8px;border-radius:6px;margin-bottom:8px;font-size:9px;border:1px solid var(--border-dark);">⚡ JIT: OFF</div>
+                    
+                    <!-- LOGS -->
+                    <div style="margin-top:4px;">
+                        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-light);margin-bottom:4px;">
+                            <span>📋 RECENT BETS</span>
+                            <span>Max Logs: 20</span>
+                        </div>
+                        <div class="logs-container" id="p-logs">
+                            <div style="text-align:center;padding:20px;color:var(--text-light);font-size:10px;">
+                                🧠 Smart Wager Farming by OrionLogic<br><br>
+                                ⚡ Smart Mode: ON (Parallel 4)<br>
+                                🃏 Baccarat Tie Recovery<br>
+                                🎯 Wager Farming System
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- TAB SETTINGS -->
+                <div id="tab-settings" class="tab-content">
+                    <div class="stats-block" style="margin-top:0px;">
+                        <div style="font-weight:700;color:var(--primary);margin-bottom:8px;font-size:11px;">📌 NORMAL MODE</div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>🎲 NORMAL CHANCE (%)</label><input type="number" id="p-normal-chance" value="99.98" step="0.01" min="1" max="99.98"></div>
+                            <div class="md-field"><label>💰 NORMAL BET (% balance)</label><input type="number" id="p-basebet-normal" value="0.5" step="0.001" min="0.01" max="10"></div>
+                        </div>
+                    </div>
+                    <div class="stats-block">
+                        <div style="font-weight:700;color:var(--primary);margin-bottom:8px;font-size:11px;">🃏 BACCARAT TIE RECOVERY</div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>📉 TRIGGER LOSS (%)</label><input type="number" id="p-baccarat-trigger" value="0.10" step="0.01" min="0.01" max="5"></div>
+                            <div class="md-field"><label>🔄 DELAY (ms)</label><input type="number" id="p-baccarat-delay" value="10" step="1" min="1" max="100"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>🔒 ENABLED</label><select id="p-baccarat-enabled"><option value="true" selected>ENABLED</option><option value="false">DISABLED</option></select></div>
+                            <div class="md-field"><label>📊 DUAL BET (% balance)</label><input type="number" id="p-baccarat-dualbet" value="0.05" step="0.01" min="0.01" max="1"></div>
+                        </div>
+                        <div style="font-size:8px;color:var(--text-light);margin-top:4px;text-align:center;">
+                            🃏 Dual Bet (0.05% each) → 10x tanpa Tie → Tie Bet Formula
+                        </div>
+                    </div>
+                    <div class="stats-block">
+                        <div style="font-weight:700;color:var(--primary);margin-bottom:8px;font-size:11px;">🎯 WAGER FARMING</div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>📊 TOTAL WAGER TARGET</label><input type="number" id="p-wager-total-target" value="10000" step="100" min="1" max="999999999"></div>
+                            <div class="md-field"><label>📊 SESI MULTIPLIER (× balance)</label><input type="number" id="p-wager-sesi-multiplier" value="2" step="0.5" min="0.5" max="100"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>📉 LOSS TOLERANCE (%)</label><input type="number" id="p-wager-loss-tolerance" value="0.5" step="0.01" min="0.01" max="10"></div>
+                        </div>
+                    </div>
+                    <div class="stats-block">
+                        <div style="font-weight:700;color:var(--primary);margin-bottom:8px;font-size:11px;">⚡ JIT (BURST) MODE</div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>⚡ EVERY N BET</label><input type="number" id="p-burst-every" value="20" step="1" min="0" max="100"></div>
+                            <div class="md-field"><label>🎲 MIN CHANCE (%)</label><input type="number" id="p-burst-min" value="90" step="0.5" min="1" max="99"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>🎲 MAX CHANCE (%)</label><input type="number" id="p-burst-max" value="98" step="0.5" min="2" max="99.98"></div>
+                            <div class="md-field"><label>💰 BET MULTIPLIER</label><input type="number" id="p-burst-multiplier" value="1.0" step="0.1" min="0.1" max="5"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>💰 MAX BET (%)</label><input type="number" id="p-jit-max-bet" value="5" step="0.5" min="0.5" max="20"></div>
+                            <div class="md-field"><label>⚡ JIT ENABLED</label><select id="p-jit-enabled"><option value="true" selected>ENABLED</option><option value="false">DISABLED</option></select></div>
+                        </div>
+                    </div>
+                    <div class="stats-block">
+                        <div style="font-weight:700;color:var(--primary);margin-bottom:8px;font-size:11px;">💰 PROFIT TARGET & STOP LOSS</div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>🎯 TARGET (Session %)</label><input type="number" id="p-target-pct" value="5" step="0.5"></div>
+                            <div class="md-field"><label>🛑 STOP LOSS (Session %)</label><input type="number" id="p-stop-pct" value="100" step="0.5"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>🎯 TARGET (Daily %)</label><input type="number" id="p-daily-target" value="25" step="1"></div>
+                            <div class="md-field"><label>🛑 STOP LOSS (Daily %)</label><input type="number" id="p-daily-stoploss" value="100" step="1"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="md-field"><label>📋 SESSION TOTAL</label><input type="number" id="p-session-total" value="8" step="1"></div>
+                            <div class="md-field"><label>💀 MAX BET CAP</label><input type="number" id="p-max-cap" value="0" step="0.001"></div>
+                        </div>
+                    </div>
+                    <div style="font-size:8px;color:var(--text-light);text-align:center;padding:4px;border-top:1px solid var(--border-dark);margin-top:4px;">
+                        ⚡ Smart Mode: ON (Parallel 4) · v4.0 · 🃏 Tie Recovery
+                    </div>
+                </div>
+            </div>
+        </div>`;
+        
+        var container = document.getElementById('BotConsole');
+        if (!container) {
+            var div = document.createElement('div');
+            div.id = 'BotConsole';
+            div.innerHTML = html;
+            document.body.appendChild(div);
+        } else {
+            container.innerHTML = html;
+        }
+        
+        // ==================== EVENT BINDINGS ====================
+        var header = document.getElementById("botHeader");
+        if (header) header.addEventListener('mousedown', dragMouseDown);
+        var minimizeBtn = document.getElementById("btn-minimize");
+        if (minimizeBtn) minimizeBtn.onclick = toggleMinimize;
+        var themeBtn = document.getElementById("btn-theme");
+        if (themeBtn) themeBtn.onclick = toggleDarkMode;
+        
+        var savedToken = getAuthToken();
+        if (savedToken) {
+            var tokenEl = document.getElementById("p-token");
+            if (tokenEl) tokenEl.value = savedToken;
+        }
+        
+        // Max Logs
+        var maxLogsEl = document.getElementById("p-max-logs");
+        if (maxLogsEl) {
+            maxLogsEl.onchange = function(e) {
+                bot.maxLogs = Math.max(10, Math.min(100, parseInt(e.target.value) || 20));
+            };
+        }
+        
+        // Baccarat Tie Recovery Events
+        var baccaratTriggerEl = document.getElementById("p-baccarat-trigger");
+        if (baccaratTriggerEl) {
+            baccaratTriggerEl.onchange = function(e) {
+                bot.baccaratTriggerPct = Math.min(5, Math.max(0.01, parseFloat(e.target.value) || 0.10));
+            };
+        }
+        var baccaratDelayEl = document.getElementById("p-baccarat-delay");
+        if (baccaratDelayEl) {
+            baccaratDelayEl.onchange = function(e) {
+                bot.baccaratDelayMs = Math.min(100, Math.max(1, parseInt(e.target.value) || 10));
+            };
+        }
+        var baccaratEnabledEl = document.getElementById("p-baccarat-enabled");
+        if (baccaratEnabledEl) {
+            baccaratEnabledEl.onchange = function(e) {
+                bot.baccaratEnabled = e.target.value === 'true';
+            };
+        }
+        var baccaratDualBetEl = document.getElementById("p-baccarat-dualbet");
+        if (baccaratDualBetEl) {
+            baccaratDualBetEl.onchange = function(e) {
+                bot.baccaratDualBetPct = Math.min(1, Math.max(0.01, parseFloat(e.target.value) || 0.05));
+            };
+        }
+        
+        // JIT Events
+        var burstEveryEl = document.getElementById("p-burst-every");
+        if (burstEveryEl) burstEveryEl.onchange = function(e) {
+            bot.burstEveryN = Math.min(100, Math.max(0, parseInt(e.target.value) || 0));
+            bot.burstCounter = 0;
+            updateBurstDisplay();
+        };
+        var burstMinEl = document.getElementById("p-burst-min");
+        if (burstMinEl) burstMinEl.onchange = function(e) {
+            bot.burstMinChance = Math.min(99, Math.max(1, parseFloat(e.target.value) || 1));
+            if (bot.burstMinChance >= bot.burstMaxChance) bot.burstMinChance = bot.burstMaxChance - 0.5;
+            updateBurstDisplay();
+        };
+        var burstMaxEl = document.getElementById("p-burst-max");
+        if (burstMaxEl) burstMaxEl.onchange = function(e) {
+            bot.burstMaxChance = Math.min(99.98, Math.max(2, parseFloat(e.target.value) || 98));
+            if (bot.burstMaxChance <= bot.burstMinChance) bot.burstMaxChance = bot.burstMinChance + 0.5;
+            updateBurstDisplay();
+        };
+        var burstMultEl = document.getElementById("p-burst-multiplier");
+        if (burstMultEl) burstMultEl.onchange = function(e) {
+            bot.burstMultiplier = Math.min(5, Math.max(0.1, parseFloat(e.target.value) || 1.0));
+            updateBurstDisplay();
+        };
+        var jitMaxBetEl = document.getElementById("p-jit-max-bet");
+        if (jitMaxBetEl) jitMaxBetEl.onchange = function(e) {
+            bot.jitMaxBetPercent = Math.min(20, Math.max(0.5, parseFloat(e.target.value) || 5));
+            updateBurstDisplay();
+        };
+        var jitEnabledEl = document.getElementById("p-jit-enabled");
+        if (jitEnabledEl) jitEnabledEl.onchange = function(e) {
+            bot.wagerJitEnabled = e.target.value === 'true';
+            updateBurstDisplay();
+        };
+        
+        // Wager Events
+        var wagerTotalTargetEl = document.getElementById("p-wager-total-target");
+        if (wagerTotalTargetEl) wagerTotalTargetEl.onchange = function(e) {
+            bot.wagerTotalTarget = Math.max(1, parseFloat(e.target.value) || 10000);
+            var display = document.getElementById("st-wager-total");
+            if (display) display.textContent = bot.wagerTotalTarget;
+            updateWagerDisplay();
+        };
+        var wagerSesiMultiplierEl = document.getElementById("p-wager-sesi-multiplier");
+        if (wagerSesiMultiplierEl) wagerSesiMultiplierEl.onchange = function(e) {
+            bot.wagerSesiMultiplier = Math.max(0.5, Math.min(100, parseFloat(e.target.value) || 2));
+            updateWagerDisplay();
+        };
+        var wagerLossToleranceEl = document.getElementById("p-wager-loss-tolerance");
+        if (wagerLossToleranceEl) wagerLossToleranceEl.onchange = function(e) {
+            bot.wagerLossTolerancePercent = Math.max(0.01, Math.min(10, parseFloat(e.target.value) || 0.5));
+            updateWagerDisplay();
+        };
+        
+        // Normal Mode Events
+        var normalChanceEl = document.getElementById("p-normal-chance");
+        if (normalChanceEl) normalChanceEl.onchange = function(e) {
+            var newChance = parseFloat(e.target.value);
+            if (newChance >= 1 && newChance <= 99.98) {
+                bot.normalChance = newChance;
+            }
+        };
+        var baseBetNormalEl = document.getElementById("p-basebet-normal");
+        if (baseBetNormalEl) baseBetNormalEl.onchange = function(e) {
+            var newPct = parseFloat(e.target.value);
+            if (newPct >= 0.01 && newPct <= 10) bot.baseBetPercent = newPct;
+        };
+        
+        // Profit Events
+        var targetPctEl = document.getElementById("p-target-pct");
+        if (targetPctEl) targetPctEl.onchange = function(e) {
+            bot.targetPct = parseFloat(e.target.value) || 5;
+        };
+        var stopPctEl = document.getElementById("p-stop-pct");
+        if (stopPctEl) stopPctEl.onchange = function(e) {
+            bot.stopLossPct = parseFloat(e.target.value) || 100;
+        };
+        var dailyTargetEl = document.getElementById("p-daily-target");
+        if (dailyTargetEl) dailyTargetEl.onchange = function(e) {
+            bot.dailyTargetPct = parseFloat(e.target.value) || 25;
+        };
+        var dailyStopEl = document.getElementById("p-daily-stoploss");
+        if (dailyStopEl) dailyStopEl.onchange = function(e) {
+            bot.dailyStopLossPct = parseFloat(e.target.value) || 100;
+        };
+        var sessionTotalEl = document.getElementById("p-session-total");
+        if (sessionTotalEl) sessionTotalEl.onchange = function(e) {
+            bot.sessionTotal = parseInt(e.target.value) || 8;
+        };
+        var maxCapEl = document.getElementById("p-max-cap");
+        if (maxCapEl) maxCapEl.onchange = function(e) {
+            bot.maxBetCap = parseFloat(e.target.value) || 0;
+        };
+        
+        // Login
+        var loginBtn = document.getElementById("p-login");
+        if (loginBtn) {
+            loginBtn.onclick = async function() {
+                var tokenEl = document.getElementById("p-token");
+                if (!tokenEl) return;
+                var token = tokenEl.value.trim();
+                if (!token || token.length < 30) return;
+                saveToken(token);
+                var success = await syncUserInfo();
+                if (success) {
+                    var startBtn = document.getElementById("p-start");
+                    if (startBtn) startBtn.disabled = false;
+                    await updateFiatRatesOnce();
+                    updateStatsDisplay();
+                    sendTelegramMessage("🧠 Smart Wager Farming by OrionLogic\n✅ LOGIN SUCCESS\nUser: " + bot.stakeUser);
+                }
+            };
+        }
+        
+        // Refresh
+        var refreshBtn = document.getElementById("p-refresh");
+        if (refreshBtn) {
+            refreshBtn.onclick = async function() {
+                if (!accessToken) return;
+                await syncUserInfo();
+                await updateFiatRatesOnce();
+                updateStatsDisplay();
+            };
+        }
+        
+        // Start
+        var startBtn = document.getElementById("p-start");
+        if (startBtn) {
+            startBtn.onclick = async function() {
+                if (bot.isPaused) {
+                    bot.isPaused = false;
+                    bot.isRunning = true;
+                    togglePauseButton(false);
+                    runLoop();
+                    return;
+                }
+                if (bot.isRunning) return;
+                
+                fullReset();
+                
+                bot.normalChance = safeGetFloat("p-normal-chance", 99.98);
+                bot.baseBetPercent = safeGetFloat("p-basebet-normal", 0.5);
+                bot.targetPct = safeGetFloat("p-target-pct", 5);
+                bot.stopLossPct = safeGetFloat("p-stop-pct", 100);
+                bot.dailyTargetPct = safeGetFloat("p-daily-target", 25);
+                bot.dailyStopLossPct = safeGetFloat("p-daily-stoploss", 100);
+                bot.sessionTotal = safeGetInt("p-session-total", 8);
+                bot.maxBetCap = safeGetFloat("p-max-cap", 0);
+                
+                // Baccarat Tie Recovery Settings
+                bot.baccaratEnabled = document.getElementById("p-baccarat-enabled") ? document.getElementById("p-baccarat-enabled").value === 'true' : true;
+                bot.baccaratTriggerPct = safeGetFloat("p-baccarat-trigger", 0.10);
+                bot.baccaratDelayMs = safeGetInt("p-baccarat-delay", 10);
+                bot.baccaratDualBetPct = safeGetFloat("p-baccarat-dualbet", 0.05);
+                
+                bot.burstEveryN = safeGetInt("p-burst-every", 20);
+                bot.burstMinChance = safeGetFloat("p-burst-min", 90);
+                bot.burstMaxChance = safeGetFloat("p-burst-max", 98);
+                bot.burstMultiplier = safeGetFloat("p-burst-multiplier", 1.0);
+                bot.jitMaxBetPercent = safeGetFloat("p-jit-max-bet", 5);
+                bot.burstCounter = 0;
+                var jitEnabledEl2 = document.getElementById("p-jit-enabled");
+                bot.wagerJitEnabled = jitEnabledEl2 ? jitEnabledEl2.value === 'true' : true;
+                
+                bot.wagerTotalTarget = safeGetFloat("p-wager-total-target", 10000);
+                bot.wagerSesiMultiplier = safeGetFloat("p-wager-sesi-multiplier", 2);
+                bot.wagerLossTolerancePercent = safeGetFloat("p-wager-loss-tolerance", 0.5);
+                bot.wagerTotalAccumulated = 0;
+                bot.wagerSesiCounter = 0;
+                bot.wagerSesiStartBal = 0;
+                bot.wagerSesiProfit = 0;
+                bot.wagerStop = false;
+                
+                await updateFiatRatesOnce();
+                
+                if (bot.fiatRates.idr > 0) {
+                    bot.minBet = bot.minBetIdr / bot.fiatRates.idr;
+                    if (bot.minBet < 0.00000001) bot.minBet = 0.00000001;
+                } else bot.minBet = 0.0014;
+                
+                var balance = bot.realBalance;
+                if (balance === 0) return;
+                
+                bot.wagerSesiStartBal = balance;
+                bot.dailyStartBalance = balance;
+                bot.dailyProfit = 0;
+                bot.dailyTargetReached = false;
+                bot.lastDailyReset = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate(), 0, 0, 0).getTime();
+                bot.stats = { profit: 0, wagered: 0, startBal: balance, currentBal: balance, bets: 0, wins: 0, loss: 0, ties: 0, startTime: Date.now(), maxDD: 0, maxBet: 0, maxDrawdownPct: 0, peakBalance: balance };
+                bot.betTimestamps = [];
+                bot.startTime = Date.now();
+                bot.sessionStartTime = new Date();
+                bot.lastBetAmount = 0;
+                bot.isRunning = true;
+                bot.isPaused = false;
+                bot.isSleeping = false;
+                bot.lastTGReport = Date.now();
+                bot.lastFiatUpdate = 0;
+                bot.isResetting = false;
+                bot.resetCountdownRemaining = 0;
+                bot.worstBet = 0;
+                bot.sessionNumber = 1;
+                bot.sessionsCompleted = 0;
+                baccaratRecovery.active = false;
+                baccaratRecovery.phase = 1;
+                baccaratRecovery.startBalance = 0;
+                baccaratRecovery.triggerBalance = 0;
+                baccaratRecovery.counter = 0;
+                baccaratRecovery.totalLoss = 0;
+                baccaratRecovery.previousBet = 0;
+                baccaratRecovery.currentBet = 0;
+                baccaratRecovery.wins = 0;
+                baccaratRecovery.losses = 0;
+                baccaratRecovery.ties = 0;
+                baccaratRecovery.totalBets = 0;
+                baccaratRecovery.forceStop = false;
+                diceInFlight = 0;
+                pendingDiceMeta = [];
+                isResting = false;
+                normalCycleStartTime = 0;
+                
+                toggleStartStop(true);
+                togglePauseButton(false);
+                var startBtnEl = document.getElementById("p-start");
+                if (startBtnEl) startBtnEl.textContent = "START";
+                
+                var burstStatus = bot.wagerJitEnabled && bot.burstEveryN > 0 ? 'ON (Every ' + bot.burstEveryN + ' bet)' : 'OFF';
+                var baccaratStatus = bot.baccaratEnabled ? 'ON (Trigger: ' + bot.baccaratTriggerPct + '%, Dual: ' + bot.baccaratDualBetPct + '%)' : 'OFF';
+                sendTelegramMessage("🧠 Smart Wager Farming by OrionLogic\n🔥 STARTED\nBalance: " + balance.toFixed(2) + "\nNormal Chance: " + bot.normalChance + "%\nJIT: " + burstStatus + "\nJIT Max Bet: " + bot.jitMaxBetPercent + "%\nTotal Wager: " + bot.wagerTotalTarget + "\nSesi Multiplier: " + bot.wagerSesiMultiplier + "× balance\nLoss Tolerance: " + bot.wagerLossTolerancePercent + "%\n🃏 Baccarat Tie Recovery: " + baccaratStatus + "\n⚡ Smart Mode: ON (Parallel " + wagerParallelCap + ")");
+                
+                updateBurstDisplay();
+                updateWagerDisplay();
+                updateRecoveryDisplay();
+                runLoop();
+            };
+        }
+        
+        function pauseBot() {
+            if (!bot.isRunning || bot.isPaused) return;
+            bot.isPaused = true;
+            bot.isRunning = false;
+            togglePauseButton(true);
+        }
+        var pauseBtn = document.getElementById("p-pause");
+        if (pauseBtn) pauseBtn.onclick = function() { if (bot.isRunning && !bot.isPaused) pauseBot(); };
+        
+        var stopBtn = document.getElementById("p-stop");
+        if (stopBtn) stopBtn.onclick = async function() { fullReset(); await sendSessionReport(); };
+        
+        var resetBtn = document.getElementById("p-reset");
+        if (resetBtn) resetBtn.onclick = function() { if (bot.isRunning) return; fullReset(); };
+        
+        var currencyEl = document.getElementById("p-currency");
+        if (currencyEl) currencyEl.onchange = function() { 
+            bot.selectedCurrency = document.getElementById("p-currency").value; 
+            bot.fiatRateFetched = false;
+            updateFiatRatesOnce();
+        };
+        
+        setInterval(updateStatsDisplay, 1000);
+        
+        updateBurstDisplay();
+        updateWagerDisplay();
+        updateRecoveryDisplay();
+        
+        var wagerTotalDisplay = document.getElementById("st-wager-total");
+        if (wagerTotalDisplay) wagerTotalDisplay.textContent = bot.wagerTotalTarget;
+    }
+    
+    // ==================== SAFE GET FUNCTIONS ====================
+    function safeGetValue(id, defaultValue) {
+        var el = document.getElementById(id);
+        if (el) return el.value;
+        return defaultValue;
+    }
+    
+    function safeGetInt(id, defaultValue) {
+        var val = parseInt(safeGetValue(id, defaultValue));
+        return isNaN(val) ? defaultValue : val;
+    }
+    
+    function safeGetFloat(id, defaultValue) {
+        var val = parseFloat(safeGetValue(id, defaultValue));
+        return isNaN(val) ? defaultValue : val;
+    }
+    
+    // ==================== DRAG FUNCTIONS ====================
+    var pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+    function dragMouseDown(e) {
+        if (e.target.closest && (e.target.closest('button') || e.target.closest('input') || e.target.closest('select'))) return;
+        e = e || window.event;
+        e.preventDefault();
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        document.onmouseup = closeDragElement;
+        document.onmousemove = elementDrag;
+    }
+    function elementDrag(e) {
+        var elmnt = document.getElementById("BotConsole");
+        e = e || window.event;
+        e.preventDefault();
+        pos1 = pos3 - e.clientX;
+        pos2 = pos4 - e.clientY;
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        var newTop = elmnt.offsetTop - pos2;
+        var newLeft = elmnt.offsetLeft - pos1;
+        var maxLeft = window.innerWidth - elmnt.offsetWidth;
+        var maxTop = window.innerHeight - elmnt.offsetHeight;
+        if (newLeft < 0) newLeft = 0;
+        if (newTop < 0) newTop = 0;
+        if (newLeft > maxLeft) newLeft = maxLeft;
+        if (newTop > maxTop) newTop = maxTop;
+        elmnt.style.top = newTop + "px";
+        elmnt.style.left = newLeft + "px";
+        elmnt.style.right = "auto";
+    }
+    function closeDragElement() { document.onmouseup = null; document.onmousemove = null; }
+
+    // ==================== TAB FUNCTION ====================
+    window.openTab = function(tabName) {
+        var tabs = document.querySelectorAll('.tab-content');
+        for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+        var target = document.getElementById('tab-' + tabName);
+        if (target) target.classList.add('active');
+        var btns = document.querySelectorAll('.tab-btn');
+        for (var j = 0; j < btns.length; j++) btns[j].classList.remove('active');
+        if (event && event.currentTarget) event.currentTarget.classList.add('active');
+    };
+
+    // ==================== TOGGLE FUNCTIONS ====================
+    function toggleMinimize() {
+        bot.minimized = !bot.minimized;
+        var body = document.getElementById("bot-body");
+        var btn = document.getElementById("btn-minimize");
+        if (bot.minimized) { if (body) body.style.display = "none"; if (btn) btn.textContent = "▼"; }
+        else { if (body) body.style.display = "block"; if (btn) btn.textContent = "▲"; }
+    }
+    
+    function toggleDarkMode() {
+        bot.darkMode = !bot.darkMode;
+        var root = document.getElementById("BotConsole");
+        if (!root) return;
+        if (bot.darkMode) {
+            root.style.setProperty('--bg', '#0d0f14');
+            root.style.setProperty('--bg-block', '#151a22');
+            root.style.setProperty('--text', '#e8edf2');
+            root.style.setProperty('--text-light', '#8899aa');
+            root.style.setProperty('--border-dark', '#2a3344');
+            root.style.setProperty('--log-bg', '#0d0f14');
+            root.style.setProperty('--primary', '#0A6EFF');
+            root.style.setProperty('--success', '#00e676');
+            root.style.setProperty('--danger', '#ff5252');
+        } else {
+            root.style.setProperty('--bg', '#f5f6fa');
+            root.style.setProperty('--bg-block', '#ffffff');
+            root.style.setProperty('--text', '#1a1a2e');
+            root.style.setProperty('--text-light', '#6b7280');
+            root.style.setProperty('--border-dark', '#e5e7eb');
+            root.style.setProperty('--log-bg', '#f5f6fa');
+            root.style.setProperty('--primary', '#0A6EFF');
+            root.style.setProperty('--success', '#00A86B');
+            root.style.setProperty('--danger', '#FF4757');
+        }
+        updateWagerDisplay();
+        updateRecoveryDisplay();
+    }
+
+    // ==================== INITIALIZATION ====================
+    createUI();
+})();
